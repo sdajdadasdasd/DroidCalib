@@ -410,6 +410,15 @@ fx = 321.03, fy = 320.83, ppx = 321.50, ppy = 241.05
 如图 经过单目图片序列不断优化处理，系统最终得到精确的内参。
 ![alt text](image.png)
 
+以下是可选的相机轨迹和深度的输出
+![alt text](image-5.png)
+内参
+![alt text](image-4.png)
+位姿
+![alt text](image-6.png)
+深度
+![alt text](image-7.png) 只输出了第一帧的
+
 ## 3.3 论文公式对应代码
 $$
 \pi(\mathbf{x}, \theta) = \begin{bmatrix} f_x \frac{x}{z} + c_x \\ f_y \frac{y}{z} + c_y \end{bmatrix}, \quad \pi^{-1}(\mathbf{u}, z, \theta) = z \begin{bmatrix} \frac{p_x - c_x}{f_x} \\ \frac{p_y - c_y}{f_y} \\ 1 \end{bmatrix} \quad (1)
@@ -515,4 +524,1029 @@ def iproj(disps, intrinsics, jacobian=False):
     return pts, None
 
 ```
+第二个公式
+$$
+\pi(\mathbf{x}, \theta) = \begin{bmatrix} f_x \frac{x}{z + \alpha ||\mathbf{x}||} + c_x \\ f_y \frac{y}{z + \alpha ||\mathbf{x}||} + c_y \end{bmatrix}, \quad (2)
+$$
+这个公式描述的是 **Mei 相机模型（Unified Camera Model）** 的投影过程。其中：
 
+- `x, y, z` 是 3D 点在相机坐标系中的坐标
+- `fx, fy` 是焦距参数
+- `cx, cy` 是主点坐标
+- `α` 是畸变参数（在代码中对应变量 `xi`）
+
+该模型用于处理 **具有强烈径向畸变的镜头，例如鱼眼镜头**。
+
+在 `droid_slam/geom/projective_ops.py` 文件中：
+
+- `proj_mei` 函数实现了 **正向投影（3D 点 → 2D 像素）**
+```python
+def proj_mei(Xs, intr, jacobian=False, return_depth=False):
+    """Mei相机模型的投影函数
+    将3D点从相机坐标系投影到图像平面坐标
+    
+    使用Mei相机模型（统一相机模型）进行投影变换，该模型可以同时处理针孔相机和鱼眼相机。
+    投影过程考虑了径向畸变的影响，通过参数xi控制畸变程度。
+    
+    投影数学公式:
+    给定3D点(X, Y, Z)和相机内参(fx, fy, cx, cy, xi)，计算其在图像上的投影坐标:
+    1. 计算点到光心的距离: r = sqrt(X² + Y² + Z²)
+    2. 计算缩放因子: factor = 1 / (Z + xi * r)
+    3. 计算归一化图像坐标: xn = X * factor, yn = Y * factor
+    4. 转换到像素坐标: x = fx * xn + cx, y = fy * yn + cy
+    
+    参数:
+        Xs: 3D点坐标，形状为[B, N, H, W, 4]，其中:
+            B - 批处理大小
+            N - 帧数
+            H - 图像高度
+            W - 图像宽度
+            4个分量分别对应[X, Y, Z, D]，其中D是原始视差值
+        intr: 相机内参，形状为[B, N, 5]，5个参数为[fx, fy, cx, cy, xi]:
+            fx, fy - x和y方向的焦距
+            cx, cy - 主点（光学中心）坐标
+            xi - Mei相机模型的畸变参数
+        jacobian: 是否计算雅可比矩阵，默认为False
+                  注意：当前实现不支持雅可比矩阵计算
+        return_depth: 是否返回深度信息，默认为False
+                      若为True则返回[x, y, depth]，否则仅返回[x, y]
+                      
+    返回:
+        coords: 投影后的像素坐标，形状取决于return_depth参数:
+                若return_depth=True: [B, N, H, W, 3] ([x, y, depth])
+                若return_depth=False: [B, N, H, W, 2] ([x, y])
+        None: 占位符，与其它投影函数接口保持一致
+        None: 占位符，与其它投影函数接口保持一致
+        
+    异常:
+        Exception: 当jacobian=True时抛出，因为当前未实现雅可比矩阵计算
+    """
+    # 提取相机内参：fx(焦距x), fy(焦距y), cx(主点x), cy(主点y), xi(Mei畸变参数)
+    fx, fy, cx, cy, xi = extract_intrinsics(intr)
+    # 分解3D点坐标为X, Y, Z分量和视差值D
+    X, Y, Z, D = Xs.unbind(dim=-1)
+
+    # 处理过小的深度值，避免数值不稳定
+    Z = torch.where(Z < 0.5*MIN_DEPTH, torch.ones_like(Z), Z)
+
+    # 计算深度的倒数
+    d = 1.0 / Z
+    # 计算3D点到光心的距离
+    r = torch.sqrt(X**2 + Y**2 + Z**2)
+    # 计算Mei投影的缩放因子
+    factor = 1.0 / (Z + xi * r)
+
+    # 执行Mei相机模型投影计算
+    x = fx * (X * factor) + cx
+    y = fy * (Y * factor) + cy
+
+    # 根据return_depth参数决定是否包含深度信息
+    if return_depth:
+        coords = torch.stack([x, y, D*d], dim=-1)
+    else:
+        coords = torch.stack([x, y], dim=-1)
+
+    # 当前版本不支持雅可比矩阵计算
+    if jacobian:
+        raise Exception("Jacobian for mei model currently not supported.")
+
+    return coords, None, None
+```
+
+核心计算过程如下：
+
+1. **计算 3D 点到相机原点的距离**
+r = sqrt(X² + Y² + Z²)
+2. **计算投影因子**
+factor = 1.0 / (Z + xi * r)
+3. **应用 Mei 模型投影公式**
+x = fx * (X * factor) + cx
+y = fy * (Y * factor) + cy
+
+
+其中，公式中的 `α‖x‖` 对应于代码中的 `xi * r`。
+
+* iproj_mei 函数实现了反向投影（2D像素到3D）
+```python
+  def iproj_mei(disps, intr, jacobian=False):
+    """Mei相机模型的逆投影函数
+    将图像平面上的像素坐标和视差值转换为Mei鱼眼相机模型下的3D点坐标
+    
+    该函数实现了Mei鱼眼相机模型的逆投影过程，根据内参将像素坐标和视差值映射到三维空间坐标。
+    
+    Args:
+        disps: 视差图，形状为[..., H, W]的张量，其中H为高度，W为宽度
+        intr: 相机内参，包含fx, fy, cx, cy, xi参数，形状为[..., 5]
+        jacobian: 是否计算雅可比矩阵，默认为False
+        
+    Returns:
+        tuple: 包含以下元素的元组:
+            - pts: 逆投影后的齐次坐标点，形状为[..., H, W, 4]
+            - None: 保留位置（用于雅可比矩阵）
+            - None: 保留位置（用于其他输出）
+            
+    Raises:
+        Exception: 当jacobian=True时抛出异常，因为当前不支持Mei模型的雅可比矩阵计算
+    """
+    # 获取视差图的高度和宽度
+    ht, wd = disps.shape[2:]
+    fx, fy, cx, cy, xi = extract_intrinsics(intr)
+    
+    # 生成像素坐标的网格
+    y, x = torch.meshgrid(
+        torch.arange(ht).to(disps.device).float(),
+        torch.arange(wd).to(disps.device).float())
+
+    # 计算中间变量rhat和factor
+    rhat = ((x - cx) / fx)**2 + ((y - cy) / fy)**2
+    factor = (xi + torch.sqrt(1 + (1 - xi**2) * rhat)) / (1 + rhat)
+
+    # 计算三维点在相机坐标系下的坐标
+    X = (x - cx) * factor / fx
+    Y = (y - cy) * factor / fy
+    Z = factor - xi
+
+    # 构造齐次坐标形式的3D点，并附加视差值
+    pts = torch.stack([X/Z, Y/Z, Z/Z, disps], dim=-1)
+
+    if jacobian:
+        raise Exception("Jacobian for mei model currently not supported.")
+
+    return pts, None, None
+```
+
+iproj 和 iproj_mei 函数之间的主要区别在于它们使用的相机模型不同：
+* iproj: 使用4个内参 [fx, fy, cx, cy]（x和y方向焦距、主点坐标）
+* iproj_mei: 使用5个内参 [fx, fy, cx, cy, xi]，额外的 xi 是Mei模型的畸变参数
+
+在投影计算上也有所不同：
+* iproj: 使用线性变换，计算简单直观：
+```
+X = (x - cx) / fx
+Y = (y - cy) / fy
+Z = 1
+```
+* iproj_mei: 使用更复杂的非线性变换来处理鱼眼镜头的畸变：
+```
+rhat = ((x - cx) / fx)**2 + ((y - cy) / fy)**2
+factor = (xi + torch.sqrt(1 + (1 - xi**2) * rhat)) / (1 + rhat)
+X = (x - cx) * factor / fx
+Y = (y - cy) * factor / fy
+Z = factor - xi
+```
+在CUDA代码中， 统一相机模型的投影变换实现如下：droid_kernels.cu第210行的函数
+```python
+proj_transform_mei(const float* uvi, const float* qij, const float* tij, 
+        const float fx, const float fy, const float cx, const float cy, 
+        const float xi, const float disp, float* uvj) {
+    /* Mei鱼眼相机模型的投影变换函数
+     * 实现从相机i到相机j的投影变换，包括逆投影、坐标变换和再投影过程
+     *
+     * 参数说明:
+     * uvi: 相机i中的像素坐标 (u, v)
+     * qij: 从相机i到相机j的旋转四元数 (qx, qy, qz, qw)
+     * tij: 从相机i到相机j的平移向量 (tx, ty, tz)
+     * fx, fy: 相机内参 - x,y方向焦距
+     * cx, cy: 相机内参 - 主点坐标
+     * xi: Mei模型畸变参数
+     * disp: 视差值
+     * uvj: 输出 - 相机j中的像素坐标 (u, v)
+     */
+
+    // 第一步：将像素坐标转换为归一化坐标（逆投影的第一步）
+    const float xs = (uvi[0] - cx) / fx;
+    const float ys = (uvi[1] - cy) / fy;
+    
+    // 第二步：计算Mei模型的逆投影因子β
+    // 公式: β = (ξ + √(1 + (1 - ξ²)(xs² + ys²))) / (1 + xs² + ys²)
+    const float beta = (xi + sqrt( 1 + ( 1 - xi * xi) * (xs * xs  + ys * ys))) 
+                       / (1 + xs * xs  + ys * ys);
+
+    // 第三步：根据β和畸变参数ξ重建三维点坐标（逆投影的完成）
+    float Xi[4];
+    float Xj[4];
+    Xi[0] = beta * xs / (beta - xi);  // X坐标
+    Xi[1] = beta * ys / (beta - xi);  // Y坐标
+    Xi[2] = 1.0;                      // Z坐标设为1（归一化深度）
+    Xi[3] = disp;                     // 保存视差值
+
+    // 第四步：应用SE(3)变换将点从相机i坐标系变换到相机j坐标系
+    // 包括旋转(qij)和平移(tij)变换
+
+    actSE3(tij, qij, Xi, Xj);
+
+    // 第五步：将变换后的3D点投影回相机j的图像平面
+    // 深度保护机制：防止除零错误和无效投影
+    const float d = (Xj[2] < MIN_DEPTH) ? 0.0 : 1.0 / Xj[2];
+    const float z = (Xj[2] < MIN_DEPTH) ? 0.0 : Xj[2];
+    
+    // 计算三维点到原点的距离
+    const float r = sqrt(Xj[0] * Xj[0] + Xj[1] * Xj[1] + z * z);
+    
+    // 计算Mei模型的正向投影因子
+    // 公式: mei_factor = 1 / (Z + ξ*r)
+    const float mei_factor = ((z + xi * r) < MIN_DEPTH) ? 0.0 : 1.0 / (z + xi * r);
+
+    // 最终投影：计算在相机j图像平面上的像素坐标
+    uvj[0] = fx * Xj[0] * mei_factor + cx;  // u坐标
+    uvj[1] = fy * Xj[1] * mei_factor + cy;  // v坐标
+}
+```
+在general_projective_transform函数中根据model_id选择相应的投影函数：
+```python
+def general_projective_transform(poses, depths, intr, ii, jj, jacobian=False, 
+                                 return_depth=False, model_id=0):
+    
+    if (model_id == 0) or (model_id == 2): # pinhole or focal
+        return projective_transform(poses, depths, intr, ii, jj, jacobian, return_depth)
+    
+    elif model_id == 1: # mei
+        return projective_transform_mei(poses, depths, intr, ii, jj, jacobian, return_depth)
+```
+公式3
+$$
+\mathbf{u}_{jl} = \pi(\mathbf{G}_{ij} \circ \pi^{-1}(\mathbf{u}_{il}, z_{il}, \theta), \theta),
+\tag{3}
+$$
+这个公式描述了从相机i中的像素点到相机j中对应像素点的投影变换过程，ujℓ 是在相机j的图像平面上，由相机i中的像素点 uiℓ 对应的3D点投影而来的预测像素坐标。
+● uiℓ：相机i中的像素坐标（2D）
+● ziℓ：相机i中像素点的深度值
+● θ：相机内参（包括 fx, fy, cx, cy, xi 等）
+● π⁻¹：逆投影函数，将2D像素坐标和深度值转换为3D点
+● Gij：刚体变换（SE3），将点从相机i坐标系变换到相机j坐标系
+● π：正向投影函数，将3D点投影到图像平面
+● ujℓ：相机j中的对应像素坐标（2D）
+
+### 1. 逆投影过程 π⁻¹(uiℓ, ziℓ, θ)
+如果model值为1，也就是选择了统一相机模型（mei）
+则逆投影过程为src/droid_kernels.cu的proj_transform_mei函数（219-237）
+```python
+// 第一步：将像素坐标转换为归一化坐标（逆投影的第一步）
+const float xs = (uvi[0] - cx) / fx;
+const float ys = (uvi[1] - cy) / fy;
+
+// 第二步：计算Mei模型的逆投影因子β
+// 公式: β = (ξ + √(1 + (1 - ξ²)(xs² + ys²))) / (1 + xs² + ys²)
+const float beta = (xi + sqrt( 1 + ( 1 - xi * xi) * (xs * xs  + ys * ys))) 
+                   / (1 + xs * xs  + ys * ys);
+
+// 第三步：根据β和畸变参数ξ重建三维点坐标（逆投影的完成）
+float Xi[4];
+Xi[0] = beta * xs / (beta - xi);  // X坐标
+Xi[1] = beta * ys / (beta - xi);  // Y坐标
+Xi[2] = 1.0;                      // Z坐标设为1（归一化深度）
+Xi[3] = disp;                     // 保存视差值
+● uvi[0] 和 uvi[1]：输入的像素坐标 u 和 v
+● cx, cy：相机主点坐标（图像中心点）
+● fx, fy：相机焦距参数
+● xi：Mei模型畸变参数
+● xs, ys：归一化图像平面坐标
+● beta：Mei模型的逆投影因子
+● Xi[4]：逆投影后的齐次3D点坐标 [X, Y, Z, disparity]
+```
+
+* 如果model的值是0或者2 也就是针孔和焦距模型。则其逆投影公式如上面公式1所示的代码一样。
+
+### 2. 坐标系变换 Gij
+```python
+float Xj[4];
+actSE3(tij, qij, Xi, Xj);
+```
+● tij[3]：从相机i到相机j的平移向量 [tx, ty, tz]
+● qij[4]：从相机i到相机j的旋转四元数 [qx, qy, qz, qw]
+● Xi[4]：相机i坐标系中的3D点
+● Xj[4]：变换到相机j坐标系中的3D点
+这段代码包括了平移和旋转 从相机i经过刚体变换到相机j
+
+### 3. 正向投影过程 π(..., θ)
+根据前述的正向投影公式进行正向投影
+
+公式4
+$$
+E(\mathbf{G}, \mathbf{z}, \theta) = \sum_{(i,j)\in\mathcal{P}} \|\underbrace{\mathbf{u}_{ij}^* - \pi(\mathbf{G}_{ij} \circ \pi^{-1}(\mathbf{u}_i, z_i, \theta), \theta)}_{\mathbf{r}_{ij}}\|^2_{\Sigma_{ij}},
+\tag{4}
+$$
+● E(G,z,θ)：重投影误差函数（代价函数）
+● (i,j)∈P：所有图像对的集合，P表示所有参与优化的图像对
+● u*ij：在图像j中观测到的图像i特征点的对应点坐标（观测值）
+● π(Gij ◦ π⁻¹(ui,zi,θ),θ)：根据公式(3)计算出的预测点坐标
+● rij：鲁棒核函数（robust kernel function），用于减少异常值的影响
+● Σij：协方差矩阵，用于加权误差计算
+● ||.||²_Σij：马氏距离（Mahalanobis distance），考虑了协方差的加权距离
+
+公式4其中的部分已在刚刚公式3中提出，其中uij是预测像素坐标，而公式4里的u*ij是对应的观测值。
+
+### 1. 残差计算（公式核心部分：u*ij − π(Gij ◦ π⁻¹(ui,zi,θ),θ)）
+python端中，在droid_slam/geom/ba.py的42行中
+```python
+r = (target - coords).view(B, N, -1, 1)
+```
+直接计算它们的差值，coords是直接调用了前面的计算预测值uij的公式代码。
+```python
+    coords, valid, (Ji, Jj, Jz) = pops.projective_transform(
+        poses, disps, intrinsics, ii, jj, jacobian=True)
+```
+```python
+def projective_transform(poses, depths, intrinsics, ii, jj, jacobian=False, return_depth=False):
+    """ map points from ii->jj """
+
+    # inverse project (pinhole)
+    X0, Jz = iproj(depths[:,ii], intrinsics[:,ii], jacobian=jacobian)
+    
+    # transform
+    Gij = poses[:,jj] * poses[:,ii].inv()
+
+    Gij.data[:,ii==jj] = torch.as_tensor([-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], device="cuda")
+    X1, Ja = actp(Gij, X0, jacobian=jacobian)
+    
+    # project (pinhole)
+    x1, Jp = proj(X1, intrinsics[:,jj], jacobian=jacobian, return_depth=return_depth)
+
+    # ...
+    return x1, valid
+```
+● iproj：执行逆投影，将图像点和深度值转换为3D点
+● poses[:,jj] * poses[:,ii].inv()：计算从图像i到图像j的变换矩阵Gij
+● actp(Gij, X0, jacobian=jacobian)：应用变换矩阵将3D点从相机i坐标系转换到相机j坐标系
+● proj：将变换后的3D点投影到相机j的图像平面上
+
+同样的，对于mei模型 也有对应的函数进行可以进行相同的变换
+
+```python
+def projective_transform_mei(poses, depths, intr, ii, jj, jacobian=False, return_depth=False):
+
+    """ map points from ii->jj """
+    if torch.sum(torch.isnan(depths))>0:
+        raise Exception('nan values in depth')
+    
+    # inverse project
+    X0, _, _ = iproj_mei(depths[:,ii], intr[:,ii], jacobian=jacobian)
+
+    # transform 计算从相机i到相机j的变换矩阵
+    Gij = poses[:,jj] * poses[:,ii].inv()
+    # 特殊处理当源图像和目标图像相同时的情况（即ii==jj）
+    Gij.data[:,ii==jj] = torch.as_tensor([-0.1, 0.0, 0.0, 0.0, 0.0, 
+                                            0.0, 1.0], device="cuda")
+    #[-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]：这是一个特殊的SE(3)李群参数
+前3个值[-0.1, 0.0, 0.0]：平移向量(tx, ty, tz) 理论上应该是无平移 但是设置了一个-0.1 小的位移 不懂为啥
+后4个值[0.0, 0.0, 0.0, 1.0]：单位四元数(0, 0, 0, 1)，表示无旋转
+                                          
+    X1, _ = actp(Gij, X0, jacobian=jacobian)
+    
+    # project 
+    x1, _, _ = proj_mei(X1, intr[:,jj], jacobian=jacobian, 
+                                return_depth=return_depth)
+
+    # exclude points too close to camera
+    valid = ((X1[...,2] > MIN_DEPTH) & (X0[...,2] > MIN_DEPTH)).float()
+    valid = valid.unsqueeze(-1) #增加一个维度
+
+    ·X0[...,2]：X0是逆投影后的3D点，[...,2]表示取Z坐标（深度）
+    ·X1[...,2]：X1是坐标变换后的3D点，[...,2]表示取Z坐标（深度）
+    ·MIN_DEPTH：最小深度阈值，常量定义为0.2
+    ·X0[...,2] > MIN_DEPTH：检查变换前的点是否距离相机足够远
+    ·X1[...,2] > MIN_DEPTH：检查变换后的点是否距离相机足够远
+    ·.float()：将布尔值转换为浮点数（True→1.0, False→0.0）
+    ·作用就是排除一些距离太近的点
+    理由：
+    ·数值稳定性：当点非常接近相机时（Z接近0），在投影计算中会出现除零或数值不稳定
+     物理合理性：实际场景中，相机不可能观测到距离自己非常近的点
+     避免奇异情况：防止在后续计算中出现无穷大或NaN值
+    
+
+
+    
+
+    if jacobian:
+        raise Exception("Jacobian for mei model currently not supported.")
+
+    return x1, valid
+
+```
+
+target的值首先经过factor_graph.py 文件中的初始化（124）
+```python
+# 在因子图中添加新的因子时，计算target值
+# target表示当前状态下，将图像ii中的点投影到图像jj中的坐标
+with torch.cuda.amp.autocast(enabled=False):
+    # 调用video的reproject函数计算target
+    # 这里计算的是基于当前位姿估计的投影结果
+    target, _ = self.video.reproject(ii, jj)
+    # 初始化权重为0，后续会根据残差动态调整
+    weight = torch.zeros_like(target)
+
+# 将新的图像对索引添加到因子图中
+self.ii = torch.cat([self.ii, ii], 0)
+self.jj = torch.cat([self.jj, jj], 0)
+# 初始化因子的年龄为0
+self.age = torch.cat([self.age, torch.zeros_like(ii)], 0)
+
+# reprojection factors
+# 添加网络相关数据
+self.net = net if self.net is None else torch.cat([self.net, net], 1)
+
+# 将计算得到的target和weight添加到因子图中
+self.target = torch.cat([self.target, target], 1)
+self.weight = torch.cat([self.weight, weight], 1)
+```
+这个函数又调用depth_video.py 文件中的 reproject 函数（第163行）
+```python
+def reproject(self, ii, jj):
+    """ project points from ii -> jj 
+    将图像ii中的点投影到图像jj中
+    
+    参数:
+        ii: 源图像索引
+        jj: 目标图像索引
+        
+    返回:
+        coords: 投影后的坐标
+        valid_mask: 有效点的掩码
+    """
+    # 格式化索引
+    ii, jj = DepthVideo.format_indicies(ii, jj)
+    # 将位姿转换为李群SE3格式
+    Gs = lietorch.SE3(self.poses[None])
+
+    # 调用投影变换函数进行投影计算
+    # 输入参数包括:
+    # - Gs: 所有图像的位姿
+    # - self.disps[None]: 所有图像的视差图
+    # - self.intrinsics[None]: 所有图像的内参
+    # - ii, jj: 源图像和目标图像索引
+    # - model_id: 相机模型ID
+    coords, valid_mask = \
+        pops.general_projective_transform(Gs, self.disps[None], self.intrinsics[None], 
+                                          ii, jj, model_id=self.model_id)
+
+    return coords, valid_mask
+
+```
+然后再调用general_projective_transform函数 在projective_ops.py 文件里
+```python
+def general_projective_transform(poses, depths, intr, ii, jj, jacobian=False, 
+                                 return_depth=False, model_id=0):
+    """
+    通用投影变换函数，根据相机模型ID选择相应的投影变换实现
+    
+    该函数实现了公式(3) ujℓ = π(Gij ◦ π⁻¹(uiℓ, ziℓ, θ), θ) 的计算过程
+    即：将图像ii中的点uiℓ通过逆投影、坐标变换、正向投影后得到图像jj中的点ujℓ
+    
+    参数:
+        poses: 相机位姿 [B, N, 7] (B:批次大小, N:图像数量, 7:SE3李群参数)
+        depths: 深度图/视差图 [B, N, H, W] (H:图像高度, W:图像宽度)
+        intr: 相机内参，根据model_id不同形状不同
+              - 针孔模型(pinhole): [B, N, 4] [fx, fy, cx, cy]
+              - Mei模型(mei): [B, N, 5] [fx, fy, cx, cy, xi]
+              - 焦距模型(focal): [B, N, 4] [fx, fy, cx, cy]
+        ii: 源图像索引
+        jj: 目标图像索引
+        jacobian: 是否计算雅可比矩阵
+        return_depth: 是否返回深度信息
+        model_id: 相机模型ID
+                  0: 针孔模型(pinhole)
+                  1: Mei模型(mei)
+                  2: 焦距模型(focal)
+                  
+    返回:
+        投影后的坐标和有效性掩码
+    """
+    
+    # 根据相机模型ID选择相应的投影变换函数
+    if (model_id == 0) or (model_id == 2): # pinhole or focal
+        # 使用针孔相机模型或焦距模型
+        return projective_transform(poses, depths, intr, ii, jj, jacobian, return_depth)
+    
+    elif model_id == 1: # mei
+        # 使用Mei鱼眼相机模型
+        return projective_transform_mei(poses, depths, intr, ii, jj, jacobian, return_depth)
+    else:
+        raise Exception('Camera model not implemented.')
+```
+.view() 函数用于改变张量的形状（shape），但不改变张量中数据的总量和顺序。它类似于NumPy中的reshape函数。
+● B：批次大小（batch size）
+● N：图像对的数量
+● -1：自动推断该维度的大小，保证总元素数量不变
+● 1：新增一个维度，大小为1
+假设我们有：
+● target 的形状为 [B, N, H, W, 2]
+● coords 的形状也为 [B, N, H, W, 2]
+● B （批次大小）
+● N （6个图像对）
+● H （图像高度）
+● W （图像宽度）
+● 2 （每个像素点的x,y坐标）
+● target - coords 的形状也是 [B, N, H, W, 2]
+● (target - coords).view(B, N, -1, 1) 将会把形状变为 [B, N, H*W*2, 1]
+这样变换后，每个图像对的所有像素点残差都被组织成一个列向量，便于进行后续的矩阵运算，如 wJiT @ r 计算残差对参数的梯度。
+
+在CUDA端中，在src/droid_kernels.cu中直接计算
+```python
+// 对于针孔相机模型(pinhole/focal)
+if (model_id == 0 || model_id == 2){
+  ru = target[block_id][0][i][j] - (fx * d * x + cx);
+  rv = target[block_id][1][i][j] - (fy * d * y + cy);
+}
+// 对于Mei鱼眼相机模型
+else {
+  const float mei_factor = ((z + xi * r) < MIN_DEPTH) ? 0.0 : 1.0 / (z + xi * r);
+  ru = target[block_id][0][i][j] - (fx * x * mei_factor + cx);
+  rv = target[block_id][1][i][j] - (fy * y * mei_factor + cy);
+}
+```
+target的计算如刚刚一样，从python端计算并且流入cuda端 再进行减去 得到差值
+
+$$
+(\hat{\mathbf{G}}, \hat{\theta}, \hat{\mathbf{z}}) = \arg\min_{\mathbf{G},\mathbf{z},\theta} E(\mathbf{G}, \mathbf{z}, \theta).
+\tag{5}
+$$
+表示的是一个优化问题，目标是找到最优的相机位姿Ĝ、相机内参θ̂和深度ẑ，使得重投影误差函数E(G,z,θ)最小化。
+优化入口：BA函数
+文件入口：droid_slam/geom/ba.py
+```python
+def BA(target, weight, eta, poses, disps, intrinsics, ii, jj, fixedp=1, rig=1):
+    """ Full Bundle Adjustment """
+    
+    B, P, ht, wd = disps.shape
+    N = ii.shape[0]
+    D = poses.manifold_dim
+
+    ### 1: compute jacobians and residuals ###
+    # 计算雅可比矩阵和残差
+    coords, valid, (Ji, Jj, Jz) = pops.projective_transform(
+        poses, disps, intrinsics, ii, jj, jacobian=True)
+
+    # 计算残差：观测值 - 预测值
+    r = (target - coords).view(B, N, -1, 1)
+    # 应用权重（包含鲁棒核函数和协方差矩阵的影响）
+    w = .001 * (valid * weight).view(B, N, -1, 1)
+
+    ### 2: construct linear system ###
+    # 构建线性系统（高斯-牛顿法的正规方程）
+    Ji = Ji.reshape(B, N, -1, D)
+    Jj = Jj.reshape(B, N, -1, D)
+    wJiT = (w * Ji).transpose(2,3)
+    wJjT = (w * Jj).transpose(2,3)
+
+    Jz = Jz.reshape(B, N, ht*wd, -1)
+
+    # 构建Hessian矩阵块
+    Hii = torch.matmul(wJiT, Ji)
+    Hij = torch.matmul(wJiT, Jj)
+    Hji = torch.matmul(wJjT, Ji)
+    Hjj = torch.matmul(wJjT, Jj)
+
+    # 构建残差向量块
+    vi = torch.matmul(wJiT, r).squeeze(-1)
+    vj = torch.matmul(wJjT, r).squeeze(-1)
+
+    # 构建与深度相关的矩阵和向量
+    Ei = (wJiT.view(B,N,D,ht*wd,-1) * Jz[:,:,None]).sum(dim=-1)
+    Ej = (wJjT.view(B,N,D,ht*wd,-1) * Jz[:,:,None]).sum(dim=-1)
+
+    w = w.view(B, N, ht*wd, -1)
+    r = r.view(B, N, ht*wd, -1)
+    wk = torch.sum(w*r*Jz, dim=-1)
+    Ck = torch.sum(w*Jz*Jz, dim=-1)
+
+    kx, kk = torch.unique(ii, return_inverse=True)
+    M = kx.shape[0]
+
+    # only optimize keyframe poses
+    P = P // rig - fixedp
+    ii = ii // rig - fixedp
+    jj = jj // rig - fixedp
+
+    # 聚合所有项构建完整的线性系统
+    H = safe_scatter_add_mat(Hii, ii, ii, P, P) + \
+        safe_scatter_add_mat(Hij, ii, jj, P, P) + \
+        safe_scatter_add_mat(Hji, jj, ii, P, P) + \
+        safe_scatter_add_mat(Hjj, jj, jj, P, P)
+
+    E = safe_scatter_add_mat(Ei, ii, kk, P, M) + \
+        safe_scatter_add_mat(Ej, jj, kk, P, M)
+
+    v = safe_scatter_add_vec(vi, ii, P) + \
+        safe_scatter_add_vec(vj, jj, P)
+
+    C = safe_scatter_add_vec(Ck, kk, M)
+    w = safe_scatter_add_vec(wk, kk, M)
+
+    C = C + eta.view(*C.shape) + 1e-7
+
+    H = H.view(B, P, P, D, D)
+    E = E.view(B, P, M, D, ht*wd)
+
+    ### 3: solve the system ###
+    # 求解线性系统（使用Schur补方法）
+    dx, dz = schur_solve(H, E, C, v, w)
+    
+    ### 4: apply retraction ###
+    # 应用更新（回缩操作）
+    poses = pose_retr(poses, dx, torch.arange(P) + fixedp)
+    disps = disp_retr(disps, dz.view(B,-1,ht,wd), kx)
+
+    disps = torch.where(disps > 10, torch.zeros_like(disps), disps)
+    disps = disps.clamp(min=0.0)
+
+    return poses, disps
+```
+其中
+公式6 $$
+\mathbf{J}^{\top}\mathbf{W}\mathbf{J}\Delta\xi = \mathbf{J}^{\top}\mathbf{W}\mathbf{r}
+\tag{6}
+$$
+高斯-牛顿正规方程 构建线性系统的重要步骤
+这是高斯-牛顿法求解非线性最小二乘问题的线性化方程，其中：
+● J 是残差函数对参数的雅可比矩阵
+● W 是权重矩阵（包含鲁棒核函数和协方差信息）
+● ∆ξ 是参数更新量
+● r 是残差向量
+
+代码实现如下：
+第一步：计算雅可比矩阵和残差（构建J和r）
+```python
+### 1: commpute jacobians and residuals ###
+coords, valid, (Ji, Jj, Jz) = pops.projective_transform(
+    poses, disps, intrinsics, ii, jj, jacobian=True)
+
+r = (target - coords).view(B, N, -1, 1)
+w = .001 * (valid * weight).view(B, N, -1, 1)
+```
+● pops.projective_transform 调用投影变换函数，同时计算雅可比矩阵（jacobian=True）
+● Ji, Jj 是残差对相机位姿的雅可比矩阵
+● Jz 是残差对深度的雅可比矩阵
+● r = (target - coords) 计算残差向量，即公式中的 r
+● w 是权重，对应公式中的 W
+第二步：构建 J^T W J 矩阵（公式左侧）
+```
+### 2: construct linear system ###
+# 重塑雅可比矩阵
+Ji = Ji.reshape(B, N, -1, D)
+Jj = Jj.reshape(B, N, -1, D)
+
+# 计算 J^T * W
+wJiT = (w * Ji).transpose(2,3)  # 这是 J_i^T * W
+wJjT = (w * Jj).transpose(2,3)  # 这是 J_j^T * W
+
+# 计算 J^T W J 矩阵块
+Hii = torch.matmul(wJiT, Ji)    # J_i^T * W * J_i
+Hij = torch.matmul(wJiT, Jj)    # J_i^T * W * J_j
+Hji = torch.matmul(wJjT, Ji)    # J_j^T * W * J_i
+Hjj = torch.matmul(wJjT, Jj)    # J_j^T * W * J_j
+```
+● wJiT = (w * Ji).transpose(2,3) 实现了 J^T * W 的计算
+● torch.matmul(wJiT, Ji) 实现了 J^T * W * J 的计算
+● 这些 H** 矩阵块构成了完整的 J^T W J 矩阵
+
+第三步：构建 J^T W r 向量（公式右侧）
+```
+# 计算 J^T W r 向量块
+vi = torch.matmul(wJiT, r).squeeze(-1)  # J_i^T * W * r
+vj = torch.matmul(wJjT, r).squeeze(-1)  # J_j^T * W * r
+```
+● torch.matmul(wJiT, r) 实现了 J^T * W * r 的计算
+● vi, vj 构成了完整的 J^T W r 向量
+● matmul: 它的作用是执行数学上的矩阵乘法  
+● .squeeze() 是 PyTorch 中一个用来挤压张量的函数，它的作用是移除所有维度为 1 的维度如果指定了参数，比如 -1，它就只移除最后一个维度  
+● 输入: 来自 matmul 的输出，维度是 (B, N, D, 1)。
+● 操作: .squeeze(-1) 会检查最后一个维度 (-1 代表最后一个维度)。
+● 发现这个维度的大小是 1。
+● 于是，它就把这个维度移除掉。
+● 输出: 移除最后一个维度后，张量的最终维度变成了 (B, N, D)。
+
+第四步：聚合和求解
+```
+### 聚合矩阵块 ###
+# 聚合 Hessian 矩阵块构建完整的 J^T W J 矩阵
+H = safe_scatter_add_mat(Hii, ii, ii, P, P) + \
+    safe_scatter_add_mat(Hij, ii, jj, P, P) + \
+    safe_scatter_add_mat(Hji, jj, ii, P, P) + \
+    safe_scatter_add_mat(Hjj, jj, jj, P, P)
+
+# 聚合梯度向量块构建完整的 J^T W r 向量
+v = safe_scatter_add_vec(vi, ii, P) + \
+    safe_scatter_add_vec(vj, jj, P)
+
+### 求解线性系统 ###
+### 3: solve the system ###
+dx, dz = schur_solve(H, E, C, v, w)
+```
+
+![alt text](image-1.png)
+其中：
+● HG 是残差对相机位姿的二阶导数（Hessian）
+● Hθ 是残差对相机内参的二阶导数
+Hz 是残差对深度的二阶导数
+● HG,θ、HG,z、Hθ,z 是混合项
+● ˜rG、˜rθ、˜rz 是对应的梯度向量
+
+第一步：计算各个分块矩阵元素如下：
+```python
+### 2: construct linear system ###
+# 计算雅可比矩阵
+Ji = Ji.reshape(B, N, -1, D)
+Jj = Jj.reshape(B, N, -1, D)
+wJiT = (w * Ji).transpose(2,3)
+wJjT = (w * Jj).transpose(2,3)
+
+# 计算深度相关的雅可比矩阵
+Jz = Jz.reshape(B, N, ht*wd, -1)
+
+# 构建 Hessian 矩阵块（公式7中的各个子块）
+# HG相关块（位姿-位姿）
+Hii = torch.matmul(wJiT, Ji)    # HG,G 块
+Hij = torch.matmul(wJiT, Jj)    # HG,G' 块
+Hji = torch.matmul(wJjT, Ji)    # HG',G 块
+Hjj = torch.matmul(wJjT, Jj)    # HG',G' 块
+
+# Hz相关块（深度-深度）
+wk = torch.sum(w*r*Jz, dim=-1)  # ˜rz的一部分
+Ck = torch.sum(w*Jz*Jz, dim=-1) # Hz对角块
+
+# 混合块（位姿-深度）
+Ei = (wJiT.view(B,N,D,ht*wd,-1) * Jz[:,:,None]).sum(dim=-1)  # HG,z 块
+Ej = (wJjT.view(B,N,D,ht*wd,-1) * Jz[:,:,None]).sum(dim=-1)  # HG',z 块
+
+# 构建梯度向量块（公式中的˜r）
+vi = torch.matmul(wJiT, r).squeeze(-1)  # ˜rG 块
+vj = torch.matmul(wJjT, r).squeeze(-1)  # ˜rG' 块
+```
+Hθ相关的矩阵在CUDA端进行计算，如下：
+```python
+// 在 opt_intr 为 true 时计算 Hθ 块
+if (opt_intr){
+  // ...
+  l=0;
+  for (int n=0; n<n_intr; n++) {
+    for (int m=0; m<=n; m++) {
+      cij[l] += wv * Jc[n] * Jc[m];  // Hθ 块的计算
+      l++;
+    }
+  }
+}
+```
+```python
+Hθ,z混合块（相机内参-深度混合项）
+// 相机内参-深度混合项
+for (int n=0; n<n_intr; n++) {
+  q[n] += wv * rv * Jc[n];                           // ˜rθ 向量的一部分
+  CalibDepth[block_id][k][n] += wv * Jz * Jc[n];     // Hθ,z 块的计算
+}
+```
+```python
+Hθ,G混合块（相机内参-位姿混合项）
+// 相机内参-位姿混合项
+for (int n=0; n<n_intr; n++) {
+  for (int m=0; m<6; m++) {
+    cpij[0][n][m] += wv * Jc[n] * Ji[m];  // Hθ,G 块
+    cpij[1][n][m] += wv * Jc[n] * Jj[m];  // Hθ,G' 块
+  }
+}
+```
+第二步：聚合构建完整系统
+```python
+# 获取唯一索引
+kx, kk = torch.unique(ii, return_inverse=True)
+M = kx.shape[0]
+
+# 只优化关键帧位姿
+P = P // rig - fixedp
+ii = ii // rig - fixedp
+jj = jj // rig - fixedp
+
+# 聚合构建分块矩阵系统（公式7的实现）
+# 构建HG块（位姿相关部分）
+H = safe_scatter_add_mat(Hii, ii, ii, P, P) + \
+    safe_scatter_add_mat(Hij, ii, jj, P, P) + \
+    safe_scatter_add_mat(Hji, jj, ii, P, P) + \
+    safe_scatter_add_mat(Hjj, jj, jj, P, P)
+
+# 构建HG,z块（位姿-深度混合部分）
+E = safe_scatter_add_mat(Ei, ii, kk, P, M) + \
+    safe_scatter_add_mat(Ej, jj, kk, P, M)
+
+# 构建˜r向量（梯度向量）
+v = safe_scatter_add_vec(vi, ii, P) + \
+    safe_scatter_add_vec(vj, jj, P)
+
+# 构建Hz块和˜rz向量
+C = safe_scatter_add_vec(Ck, kk, M)
+w = safe_scatter_add_vec(wk, kk, M)
+
+# 添加正则化项
+C = C + eta.view(*C.shape) + 1e-7
+
+# 重塑为合适的维度
+H = H.view(B, P, P, D, D)    # HG 块
+E = E.view(B, P, M, D, ht*wd) # HG,z 块
+```
+
+![alt text](image-2.png)
+● A 对应位姿和内参的Hessian矩阵块
+● B 对应位姿-内参与深度之间的混合块
+● Hz 对应深度的Hessian矩阵块
+● ∆ξG,θ 是位姿和内参的参数更新量
+● ∆z 是深度的参数更新量
+● ˜rG,θ 是位姿和内参的梯度向量
+● ˜rz 是深度的梯度向量
+
+公式的构建过程
+1.A矩阵构建（位姿和内参Hessian块）
+```python
+// 在 projective_transform_kernel 中计算 H 块（公式8中的A矩阵部分）
+l=0;
+for (int n=0; n<12; n++) {
+  for (int m=0; m<=n; m++) {
+    hij[l] += wu * Jx[n] * Jx[m];
+    l++;
+  }
+}
+
+// 在BA函数中聚合为完整的A矩阵
+SparseBlockAsym A = pose_calib_block(Hs, vs, Calib, q, CalibPose, ii, jj, t0, t1);
+```
+PYTHON端
+```python
+# 构建A矩阵（位姿部分）
+H = safe_scatter_add_mat(Hii, ii, ii, P, P) + \
+    safe_scatter_add_mat(Hij, ii, jj, P, P) + \
+    safe_scatter_add_mat(Hji, jj, ii, P, P) + \
+    safe_scatter_add_mat(Hjj, jj, jj, P, P)
+
+```
+
+2.B矩阵构建（位姿-深度混合块）
+CUDA端
+```
+// 在 projective_transform_kernel 中计算 E 块（公式8中的B矩阵部分）
+Eii[block_id][n][k] = wu * Jz * Ji[n];
+Eij[block_id][n][k] = wu * Jz * Jj[n];
+
+// 在BA函数中聚合为完整的B矩阵
+
+torch::Tensor Ei = accum_cuda(Eii.view({num, 6*ht*wd}), ii, ts).view({t1-t0, 6, ht*wd});
+torch::Tensor E = torch::cat({Ei, Eij}, 0);
+```
+PYTHON端
+```
+# 构建B矩阵（位姿-深度混合部分）
+E = safe_scatter_add_mat(Ei, ii, kk, P, M) + \
+    safe_scatter_add_mat(Ej, jj, kk, P, M)
+```
+3. Hz矩阵构建（深度Hessian块）
+CUDA:
+```c++
+// 在 projective_transform_kernel 中计算 C 块（公式8中的Hz矩阵部分）
+Cii[block_id][k] = wu * Jz * Jz;
+
+// 在BA函数中聚合为完整的Hz矩阵
+torch::Tensor C = accum_cuda(Cii, ii, kx) + m * alpha + (1 - m) * eta.view({-1, ht*wd});
+```
+PYTHON:
+```python
+# 构建Hz矩阵（深度部分）
+C = safe_scatter_add_vec(Ck, kk, M)
+C = C + eta.view(*C.shape) + 1e-7
+```
+4. 梯度向量构建
+CUDA:
+```
+// 在 projective_transform_kernel 中计算梯度向量
+for (int n=0; n<6; n++) {
+  vi[n] += wu * ru * Ji[n];  // ˜rG 部分
+  vj[n] += wu * ru * Jj[n];
+}
+
+// 相机内参梯度向量
+for (int n=0; n<n_intr; n++) {
+  q[n] += wv * rv * Jc[n];   // ˜rθ 部分
+}
+
+// 深度梯度向量
+bz[block_id][k] = wu * ru * Jz;  // ˜rz 部分
+```
+Python端:
+```python
+# 构建梯度向量
+v = safe_scatter_add_vec(vi, ii, P) + \
+    safe_scatter_add_vec(vj, jj, P)  # ˜rG,θ 向量
+
+w = safe_scatter_add_vec(wk, kk, M)  # ˜rz 向量
+```
+上述公式8 描述了分块线性系统的结构 接下来
+ ![alt text](image-3.png)
+公式9和公式10是求解这个分块系统的方法
+文件: droid_slam/geom/chol.py 函数: schur_solve
+```PYTHON
+def schur_solve(H, E, C, v, w, ep=0.1, lm=0.0001, sless=False):
+    # 这些参数对应公式(8)中的分块矩阵
+    # H 对应 A (位姿Hessian)
+    # E 对应 B (位姿-深度混合块)
+    # C 对应 Hz (深度Hessian)
+    # v 对应 ˜rG,θ (位姿梯度)
+    # w 对应 ˜rz (深度梯度)
+
+    # 计算 Hz^(-1)
+    Q = (1.0 / C).view(B, M*HW, 1)
+
+    # 构建Schur补矩阵 S = A - B Hz^(-1) BT [公式(9)的一部分]
+    Et = E.transpose(1,2)
+    S = H - torch.matmul(E, Q*Et)
+
+    # 构建右端项 ˜rG,θ - B Hz^(-1) ˜rz [公式(9)的另一部分]
+    v = v - torch.matmul(E, Q*w)
+
+    # 求解 ∆ξG,θ = [A - B Hz^(-1) BT]^(-1) (˜rG,θ - B Hz^(-1) ˜rz) [公式(9)]
+    dx = CholeskySolver.apply(S, v)
+
+    # 计算 ∆z = Hz^(-1) (˜rz - BT ∆ξG,θ) [公式(10)]
+    dz = Q * (w - Et @ dx)
+```
+
+```C++ 
+在CUDA端的实现
+文件: src/droid_kernels.cu
+
+
+// 构建Schur补系统（公式(8)的实现中包含了公式(9)和(10)的计算）
+SparseBlockAsym A = pose_calib_block(Hs, vs, Calib, q, CalibPose, ii, jj, t0, t1);
+SparseBlockAsym S = schur_calib_block(E, Q, CD_block, w, ii_exp, jj_exp, kk_exp, kx, t0, t1);
+
+// 求解 Schur 补系统: (A - S) * ∆ξG,θ = ˜rG,θ - B Hz^(-1) ˜rz [公式(9)]
+dxdI = (A - S).solve(lm, ep);
+
+// 分离结果得到 ∆ξG,θ 和 ∆z [公式(10)的结果也包含在其中]
+```
+
+## 其他公式
+相关性计算：
+文件: droid_slam/modules/corr.py 主要类: CorrBlock
+功能: 构建四维相关体Cij ∈ RH×W×H×W，包含所有特征向量对的内积
+```python
+def corr(fmap1, fmap2):
+    """ 
+    计算所有像素对之间的相关性 (all-pairs correlation)。
+    这个函数的目标是构建一个相关性体积，其中每个元素代表 fmap1 中的一个像素
+    与 fmap2 中的一个像素之间的视觉相似度（通过内积计算）。
+
+    Args:
+        fmap1 (torch.Tensor): 第一个特征图张量。
+        fmap2 (torch.Tensor): 第二个特征图张量。
+
+    Returns:
+        corr (torch.Tensor): 计算出的相关性体积。
+    """
+    
+    # --- 步骤 1: 获取维度信息并重塑 (Reshape) 张量 ---
+    # fmap1的原始维度是 (batch, num, dim, ht, wd)
+    # batch: 批次大小
+    # num: 序列中的图像数量
+    # dim: 特征向量的维度 (例如 128)
+    # ht, wd: 特征图的高度和宽度
+    batch, num, dim, ht, wd = fmap1.shape
+    
+    # 为了使用高效的矩阵乘法来计算所有对的内积，我们需要将空间维度 (ht, wd) 拉平。
+    # (batch, num, dim, ht, wd) -> (batch*num, dim, ht*wd)
+    # ht*wd 代表了单张特征图的总像素/特征向量数量。
+    # / 4.0 是一个缩放因子，用于调整特征的数值范围，有助于在训练时保持数值稳定性。
+    fmap1 = fmap1.reshape(batch*num, dim, ht*wd) / 4.0
+    fmap2 = fmap2.reshape(batch*num, dim, ht*wd) / 4.0
+    
+    # --- 步骤 2: 计算相关性 (矩阵乘法) ---
+    # 这是计算的核心步骤。
+    # fmap1.transpose(1,2) 将 fmap1 的维度从 (B*N, D, H*W) 变为 (B*N, H*W, D)。
+    # fmap2 的维度是 (B*N, D, H*W)。
+    # torch.matmul 执行的是批处理矩阵乘法 (batch matrix multiplication)。
+    # 对于批次中的每一对特征图，它计算的是一个 (H*W, D) 矩阵和一个 (D, H*W) 矩阵的乘积。
+    #
+    # 结果矩阵的维度是 (H*W, H*W)。这个结果矩阵中位于 (i, j) 位置的元素，
+    # 正是 fmap1 的第 i 个像素的特征向量与 fmap2 的第 j 个像素的特征向量的内积（点积）。
+    # 这就一次性计算出了所有像素对之间的相似度分数。
+    corr = torch.matmul(fmap1.transpose(1,2), fmap2)
+    
+    # --- 步骤 3: 恢复维度 ---
+    # 将拉平的结果重新塑造成一个更直观的、高维的相关性体积。
+    # (B*N, H*W, H*W) -> (batch, num, ht, wd, ht, wd)
+    # 最终的维度可以这样理解：对于批次中的每个序列的每一对图像，
+    # 我们可以通过 (h1, w1, h2, w2) 来索引 fmap1 在 (h1, w1) 的像素
+    # 与 fmap2 在 (h2, w2) 的像素之间的相关性分数。
+    return corr.view(batch, num, ht, wd, ht, wd)
+```
+特点:
+● 计算所有特征向量对的内积
+● 使用按需计算策略减少内存消耗
+● 通过CorrSampler类实现查找操作
+
+按需计算策略所对应的函数如下：
+```
+类: CorrSampler 功能: 使用查找算子按需计算相关性条目
+class CorrSampler(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, volume, coords, radius):
+        ctx.save_for_backward(volume,coords)
+        ctx.radius = radius
+        corr, = droid_backends.corr_index_forward(volume, coords, radius)
+        return corr
+```
+CorrSampler 之所以能实现“按需计算”，关键在于它并不预先计算并存储完整的相关性体（correlation volume），而是通过 coords 和 radius 在前向过程中动态索引出当前迭代所需的局部相关性区域。也就是说，它每次只调用 corr_index_forward 从 volume 中提取局部 patch，而不是一次性展开所有可能的相关性组合，从而显著降低显存占用和计算量，实现按需查取、即时计算、用完即丢的策略
