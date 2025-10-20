@@ -420,6 +420,9 @@ pip install torch-geometric -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
 ```python 
 python setup.py install #执行安装程序
 ```
+```python
+https://drive.usercontent.google.com/download?id=1AlfhZnGmlsKWGcNHFB1i8i8Jzn4VHB15&authuser=0 #用此链接下载数据集，放到datasets/demo文件夹里
+```
 ```python 
 python demo.py --imagedir=datasets/demo/abandonedfactory --opt_intr --num_images=300 #进行测试
 ```
