@@ -420,7 +420,9 @@ fx = 321.03, fy = 320.83, ppx = 321.50, ppy = 241.05
 ![alt text](image-7.png) 只输出了第一帧的
 
 ## 3.3 论文公式对应代码
-$$\pi(\mathbf{x}, \theta) = \begin{bmatrix} f_x \frac{x}{z} + c_x \\ f_y \frac{y}{z} + c_y \end{bmatrix}, \quad \pi^{-1}(\mathbf{u}, z, \theta) = z \begin{bmatrix} \frac{p_x - c_x}{f_x} \\ \frac{p_y - c_y}{f_y} \\ 1 \end{bmatrix} \quad (1)$$
+$$
+\pi(\mathbf{x}, \theta) = \begin{bmatrix} f_x \frac{x}{z} + c_x \\ f_y \frac{y}{z} + c_y \end{bmatrix}, \quad \pi^{-1}(\mathbf{u}, z, \theta) = z \begin{bmatrix} \frac{p_x - c_x}{f_x} \\ \frac{p_y - c_y}{f_y} \\ 1 \end{bmatrix} \quad (1)
+$$
 在 `droid_slam/geom/projective_ops.py` 中 101-128行的`proj`函数已经实现了正向投影和反向投影（python版本）。
 
 ### 正向投影（👈）代码实现
